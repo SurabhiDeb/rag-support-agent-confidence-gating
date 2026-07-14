@@ -77,7 +77,9 @@ The retrieve → score confidence → gate on topic → answer-or-escalate-with-
 
 ---
 
-Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index](https://github.com/YOUR-USERNAME) for related builds (voice lead qualification, speed-to-lead systems, financial reporting automation).
+Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index](https://surabhideb.github.io/earlyecho-website/) for related builds (voice lead qualification, speed-to-lead systems, financial reporting automation).
+<img width="1876" height="626" alt="RAG SaaS" src="https://github.com/user-attachments/assets/d16dcea7-33f4-4c07-b30f-77f8b4a5b1b3" />
+
 
 ## License
 
