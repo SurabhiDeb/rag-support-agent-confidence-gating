@@ -1,0 +1,263 @@
+{
+  "name": "RAG Support Agent - Confidence Gating + Escalation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rag-support",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Incoming Ticket (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 520],
+      "webhookId": "rag-support"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gemini-embedding-001', input: $json.body.message }) }}",
+        "options": {}
+      },
+      "id": "embed-query",
+      "name": "OpenAI · Embed Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 520],
+      "notes": "Routed through Google AI Studio's OpenAI-compatible endpoint (free, separate key from AICredits) — n8n has no main-flow node that returns a raw embedding vector. AICredits doesn't currently offer a working embeddings model despite their docs, so embeddings use Google's gemini-embedding-001 directly (3072 dims — the Supabase column must be vector(3072)). Attach an 'HTTP Header Auth' credential: Authorization = Bearer <GOOGLE_API_KEY> (from aistudio.google.com/apikey). If you later move to a direct OpenAI key, switch to https://api.openai.com/v1/embeddings + model 'text-embedding-3-small' and resize the column to vector(1536)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select id, title, content,\n       1 - (embedding <=> '{{ JSON.stringify($json.data[0].embedding) }}'::vector) as similarity\nfrom documents\norder by embedding <=> '{{ JSON.stringify($json.data[0].embedding) }}'::vector\nlimit 5;",
+        "options": {}
+      },
+      "id": "vector-search",
+      "name": "Supabase · Vector Match",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [660, 520],
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_SUPABASE_PG_CRED", "name": "Supabase Postgres" }
+      },
+      "notes": "Supabase is Postgres — this runs the pgvector similarity query directly and returns an explicit `similarity` score per row. That score is what the gate reads."
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "openai/gpt-4o-mini", "cachedResultName": "openai/gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You are a routing classifier. Return ONLY JSON: {\"topic\":\"<how_to|billing|refund|cancellation|account_access|security|legal_contractual|other>\",\"protected\":<true|false>}. protected is true for billing, refund, cancellation, account_access, security, legal_contractual; false for how_to and other." },
+            { "role": "user", "content": "={{ $('Incoming Ticket (Webhook)').item.json.body.message }}" }
+          ]
+        },
+        "jsonOutput": true,
+        "options": { "temperature": 0 }
+      },
+      "id": "classify-topic",
+      "name": "OpenAI · Classify Topic",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [880, 520],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- THE GATE: this node makes the decision, not the LLM ----\nconst THRESHOLD = 0.78; // tune per embedding model\n\nconst message = $('Incoming Ticket (Webhook)').item.json.body.message;\nconst conversationId = $('Incoming Ticket (Webhook)').item.json.body.conversation_id;\nconst email = $('Incoming Ticket (Webhook)').item.json.body.customer_email;\n\n// Postgres returns one item per matched row, each with a `similarity` score\nconst rows = $('Supabase · Vector Match').all().map(i => i.json);\nconst topSim = rows.length ? Number(rows[0].similarity) : 0;\n\n// Classifier output (defensive: OpenAI node output shape varies by version)\nlet topic = 'other';\nlet isProtected = false;\ntry {\n  const c = $('OpenAI · Classify Topic').item.json;\n  const txt = c.message?.content ?? c.content ?? c.text ?? JSON.stringify(c);\n  const parsed = typeof txt === 'string' ? JSON.parse(txt) : txt;\n  topic = parsed.topic || 'other';\n  isProtected = parsed.protected === true;\n} catch (e) { /* fail safe: treat as non-protected, gate on confidence */ }\n\n// TWO INDEPENDENT GATES. Auto-answer only if BOTH pass.\nlet decision, reason;\nif (isProtected) {\n  decision = 'escalate';\n  reason = 'protected_topic:' + topic;           // never auto-answer, even at high confidence\n} else if (topSim < THRESHOLD) {\n  decision = 'escalate';\n  reason = 'low_confidence:' + topSim.toFixed(2); // undocumented / weak match -> don't guess\n} else {\n  decision = 'answer';\n  reason = 'auto_answer';\n}\n\nconst sources = rows.slice(0, 3)\n  .map(r => `[${r.title || 'source'}] ${r.content || ''}`)\n  .join('\\n---\\n');\n\nreturn [{ json: { message, conversationId, email, topic, protected: isProtected, topSim, decision, reason, sources } }];"
+      },
+      "id": "gate",
+      "name": "Confidence + Topic Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 520]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "answer",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "route-decision",
+      "name": "Answer or Escalate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1320, 520]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "openai/gpt-4o-mini", "cachedResultName": "openai/gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You are [Product Name] support. Answer ONLY from the sources. If the sources do not contain the answer, output exactly INSUFFICIENT_CONTEXT and nothing else. Never invent policies, prices, limits, or numbers. End with the source title(s) you used." },
+            { "role": "user", "content": "={{ 'SOURCES:\\n' + $json.sources + '\\n\\nQUESTION:\\n' + $json.message }}" }
+          ]
+        },
+        "options": { "temperature": 0.2 }
+      },
+      "id": "generate-answer",
+      "name": "OpenAI · Generate Grounded Answer",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1540, 360],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.message?.content ?? $json.content ?? $json.text }}",
+              "rightValue": "INSUFFICIENT_CONTEXT",
+              "operator": { "type": "string", "operation": "notContains" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "sufficient-check",
+      "name": "Answer Grounded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1760, 360]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "openai/gpt-4o-mini", "cachedResultName": "openai/gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "Draft a SUGGESTED reply for a HUMAN agent to review (will NOT be auto-sent). Ground it in the sources. For billing/refund/cancellation/account questions add a line starting 'Reviewer note:' telling the agent to verify the customer's actual account/charge before sending. Never fabricate account-specific amounts, dates, or IDs — use placeholders like [verify amount]." },
+            { "role": "user", "content": "={{ 'ESCALATION REASON: ' + $('Confidence + Topic Gate').item.json.reason + '\\n\\nSOURCES:\\n' + $('Confidence + Topic Gate').item.json.sources + '\\n\\nQUESTION:\\n' + $('Confidence + Topic Gate').item.json.message }}" }
+          ]
+        },
+        "options": { "temperature": 0.2 }
+      },
+      "id": "draft-human",
+      "name": "OpenAI · Draft for Human",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1540, 660],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "mode": "name", "value": "#support-escalations" },
+        "text": "={{ ':warning: *Support escalation — needs a human*\\n*Reason:* ' + $('Confidence + Topic Gate').item.json.reason + '  |  *Confidence:* ' + $('Confidence + Topic Gate').item.json.topSim.toFixed(2) + '\\n*Customer:* ' + $('Confidence + Topic Gate').item.json.email + '\\n*Question:* ' + $('Confidence + Topic Gate').item.json.message + '\\n\\n*Suggested draft (verify before sending):*\\n' + ($json.message?.content ?? $json.content ?? $json.text) }}",
+        "otherOptions": {}
+      },
+      "id": "post-slack",
+      "name": "Slack · Post to Human Queue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1760, 660],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_WITH_SLACK_CRED", "name": "Slack account" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', decision: $('Confidence + Topic Gate').item.json.decision, reason: $('Confidence + Topic Gate').item.json.reason, confidence: $('Confidence + Topic Gate').item.json.topSim, answer: ($json.message?.content ?? $json.content ?? null) }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond to Ticket Source",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2000, 520]
+    },
+    {
+      "parameters": {
+        "content": "## RAG Support Agent — Confidence Gating + Escalation\n\n**The whole point lives in the `Confidence + Topic Gate` node.** The OpenAI nodes write answers; they do NOT decide whether to answer. The gate does.\n\n**Auto-answer only if BOTH:**\n- retrieval confidence ≥ 0.78 (top `Supabase · Vector Match` score), AND\n- topic ∉ {billing, refund, cancellation, account_access, security, legal}\n\nEverything else → draft + escalate to a human, never auto-sent.\n\n### Flow (left → right)\n1. **OpenAI · Embed Query** → 2. **Supabase · Vector Match** (pgvector similarity) → 3. **OpenAI · Classify Topic** → 4. **Gate** decides.\n5a. **Answer path:** Generate grounded answer → `Answer Grounded?` (catches `INSUFFICIENT_CONTEXT`) → respond to the customer.\n5b. **Escalate path:** Draft for Human → Slack post with reason + confidence + sources.\n\nNote: `Answer Grounded?` FALSE re-routes into **OpenAI · Draft for Human** — even a confident question the generator can't actually ground gets escalated, not faked.",
+        "height": 320,
+        "width": 480,
+        "color": 5
+      },
+      "id": "sticky-overview",
+      "name": "How the gate works",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1060, 120]
+    },
+    {
+      "parameters": {
+        "content": "### Credentials to set (once)\n- **OpenAI account** (used by all 3 langchain OpenAI nodes) → set **Base URL** to `https://api.aicredits.in/v1`, API key = your AICredits key (`sk-...`). Model fields are `openai/gpt-4o-mini` (verified working via the AICredits Playground).\n- **OpenAI · Embed Query** (HTTP) → attach a *separate* *HTTP Header Auth* credential: `Authorization = Bearer <GOOGLE_API_KEY>` (a free key from aistudio.google.com/apikey — NOT your AICredits key). Node URL already points at `https://generativelanguage.googleapis.com/v1beta/openai/embeddings`, model `gemini-embedding-001` (AICredits has no working embedding model right now).\n- **Supabase Postgres** → on `Supabase · Vector Match`. Get host/db/user/pass from Supabase → Project Settings → Database. Enable `pgvector` and create a `documents(id, title, content, embedding vector(3072))` table — 3072 to match gemini-embedding-001's default output size.\n- **Slack account** → on `Slack · Post to Human Queue`. Set the channel (e.g. `#support-escalations`).\n\n### Then\n- Point your ticket source (Intercom/Zendesk/Freshdesk/widget) at the webhook Production URL.\n- Set the workflow **Active**.\n\n### Going to a real client\nSwap the AICredits Base URL for `https://api.openai.com/v1` and the embeddings node for `https://api.openai.com/v1/embeddings` + model `text-embedding-3-small` once billing is on the client's own OpenAI account — resize the Supabase column to 1536 to match.\n\n### Demo→live swap seams\nKnowledge base = re-index client docs · Ticket source = client helpdesk · Escalation queue = client Slack · `THRESHOLD` + protected-topic list = config, not code.",
+        "height": 340,
+        "width": 440,
+        "color": 4
+      },
+      "id": "sticky-setup",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1560, 900]
+    }
+  ],
+  "connections": {
+    "Incoming Ticket (Webhook)": {
+      "main": [[{ "node": "OpenAI · Embed Query", "type": "main", "index": 0 }]]
+    },
+    "OpenAI · Embed Query": {
+      "main": [[{ "node": "Supabase · Vector Match", "type": "main", "index": 0 }]]
+    },
+    "Supabase · Vector Match": {
+      "main": [[{ "node": "OpenAI · Classify Topic", "type": "main", "index": 0 }]]
+    },
+    "OpenAI · Classify Topic": {
+      "main": [[{ "node": "Confidence + Topic Gate", "type": "main", "index": 0 }]]
+    },
+    "Confidence + Topic Gate": {
+      "main": [[{ "node": "Answer or Escalate?", "type": "main", "index": 0 }]]
+    },
+    "Answer or Escalate?": {
+      "main": [
+        [{ "node": "OpenAI · Generate Grounded Answer", "type": "main", "index": 0 }],
+        [{ "node": "OpenAI · Draft for Human", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI · Generate Grounded Answer": {
+      "main": [[{ "node": "Answer Grounded?", "type": "main", "index": 0 }]]
+    },
+    "Answer Grounded?": {
+      "main": [
+        [{ "node": "Respond to Ticket Source", "type": "main", "index": 0 }],
+        [{ "node": "OpenAI · Draft for Human", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI · Draft for Human": {
+      "main": [[{ "node": "Slack · Post to Human Queue", "type": "main", "index": 0 }]]
+    },
+    "Slack · Post to Human Queue": {
+      "main": [[{ "node": "Respond to Ticket Source", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
